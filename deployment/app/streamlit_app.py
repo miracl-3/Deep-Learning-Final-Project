@@ -1,5 +1,6 @@
 import json
 
+import numpy as np
 import pandas as pd
 import requests
 import streamlit as st
@@ -88,6 +89,90 @@ def format_market_label(metadata):
     market = metadata.get("market", "Unknown market")
     target = metadata.get("target_column", "target")
     return ticker, market, target
+
+
+def get_required_price_columns(metadata):
+    return metadata.get("required_price_columns") or ["Open", "High", "Low", "Close", "Volume"]
+
+
+def build_sample_price_frame(seq_len, metadata):
+    market = str(metadata.get("market", "")).lower()
+    required_cols = get_required_price_columns(metadata)
+
+    base_price = 35000.0 if "vietnam" in market else 28.0
+    base_volume = 1_200_000.0 if "vietnam" in market else 2_500_000.0
+    dates = pd.date_range(end=pd.Timestamp.today().normalize(), periods=seq_len, freq="B")
+    rows = []
+
+    for idx, date in enumerate(dates):
+        close = base_price * (1 + 0.0025 * idx + 0.012 * np.sin(idx / 3))
+        open_price = close * (1 - 0.002 + 0.003 * np.cos(idx / 4))
+        high = max(open_price, close) * 1.012
+        low = min(open_price, close) * 0.988
+        adjusted_close = close * 0.998
+        volume = base_volume * (1 + 0.08 * np.sin(idx / 5))
+
+        row = {"Date": date.date().isoformat()}
+        values = {
+            "Open": open_price,
+            "High": high,
+            "Low": low,
+            "Close": close,
+            "Adjusted Close": adjusted_close,
+            "Volume": volume,
+        }
+
+        for col in required_cols:
+            row[col] = round(values[col], 4 if col != "Volume" else 0)
+
+        rows.append(row)
+
+    return pd.DataFrame(rows)
+
+
+def compute_model_features(price_df, feature_names, metadata):
+    df = price_df.copy()
+    required_cols = get_required_price_columns(metadata)
+
+    for col in required_cols:
+        if col not in df.columns:
+            raise ValueError(f"Missing required column: {col}")
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    if "Adjusted Close" in feature_names and "Adjusted Close" not in df.columns and "Close" in df.columns:
+        df["Adjusted Close"] = df["Close"]
+
+    target_col = metadata.get("target_column")
+    if target_col not in df.columns:
+        target_col = "Adjusted Close" if "Adjusted Close" in df.columns else "Close"
+
+    price = pd.to_numeric(df[target_col], errors="coerce").ffill().bfill()
+    safe_price = price.replace(0, np.nan)
+
+    if "Log Return" in feature_names:
+        df["Log Return"] = np.log(safe_price).diff().replace([np.inf, -np.inf], np.nan).fillna(0)
+    if "MA10" in feature_names:
+        df["MA10"] = price.rolling(window=10, min_periods=1).mean()
+    if "MA20" in feature_names:
+        df["MA20"] = price.rolling(window=20, min_periods=1).mean()
+    if "Volatility10" in feature_names:
+        df["Volatility10"] = df.get("Log Return", pd.Series(0, index=df.index)).rolling(
+            window=10,
+            min_periods=2,
+        ).std().fillna(0)
+
+    missing = [col for col in feature_names if col not in df.columns]
+    if missing:
+        raise ValueError(f"Missing model feature columns after transformation: {missing}")
+
+    return df[feature_names].astype(float).ffill().bfill().fillna(0)
+
+
+def frame_to_payload(feature_df):
+    return {
+        "features": feature_df.astype(float).values.tolist(),
+        "scaled": False,
+    }
 
 
 def build_sample_payload(seq_len, feature_names, feature_count):
@@ -282,55 +367,132 @@ with forecast_tab:
     with top_left:
         st.subheader(f"{ticker} Next-Day Forecast")
         st.write(
-            "Enter the latest stock price history and technical indicators. "
-            "For this prototype, the sample input uses scaled values so the deployment can be tested quickly."
+            "Enter or upload the latest stock price history. "
+            "The app computes the technical indicators and sends them to the FastAPI model service."
         )
     with top_right:
         st.metric("Market", market)
         st.metric("Target", target)
 
+    required_cols = get_required_price_columns(metadata)
     st.info(
-        f"The model expects {seq_len} trading days and {feature_count} features per day. "
-        "The fields represent recent prices and indicators such as returns, moving averages, and volatility."
+        f"Recommended input: {seq_len} recent trading days with these columns: "
+        f"{', '.join(required_cols)}. Indicators such as returns, moving averages, "
+        "and volatility are computed automatically."
     )
 
     if feature_names:
-        st.caption("Feature order used by the model")
-        st.dataframe(
-            pd.DataFrame({"Feature": feature_names}),
-            use_container_width=True,
-            hide_index=True,
-        )
+        with st.expander("Model feature order", expanded=False):
+            st.dataframe(
+                pd.DataFrame({"Feature": feature_names}),
+                use_container_width=True,
+                hide_index=True,
+            )
 
     with st.expander("Model metadata", expanded=False):
         st.json(models.get(task_key, {}))
 
-    sample_payload = build_sample_payload(seq_len, feature_names, feature_count)
-
-    user_json = st.text_area(
-        "Recent Price and Indicator Input",
-        value=json.dumps(sample_payload, indent=2),
-        height=280,
+    input_mode = st.radio(
+        "Input method",
+        [
+            "Edit recent price table",
+            "Upload CSV",
+            "Advanced JSON",
+        ],
+        horizontal=True,
     )
 
-    preview_payload = parse_payload(user_json)
-    if preview_payload:
-        preview_df = features_to_frame(preview_payload, feature_names)
-        if not preview_df.empty:
-            st.caption("Input preview")
-            st.dataframe(preview_df.tail(8), use_container_width=True, hide_index=True)
+    payload = None
 
-            numeric_df = preview_df.select_dtypes(include="number")
-            if not numeric_df.empty:
-                st.caption("Recent input trend")
-                st.line_chart(numeric_df.iloc[:, : min(4, len(numeric_df.columns))])
+    if input_mode == "Edit recent price table":
+        st.caption(
+            "Recommended for demos: edit recent stock prices directly. "
+            "Technical indicators are computed automatically from this table."
+        )
+        sample_prices = build_sample_price_frame(seq_len, metadata)
+        edited_prices = st.data_editor(
+            sample_prices,
+            use_container_width=True,
+            hide_index=True,
+            num_rows="fixed",
+            key=f"{task_key}_price_editor",
+        )
+        st.download_button(
+            "Download sample input CSV",
+            data=sample_prices.to_csv(index=False).encode("utf-8"),
+            file_name=f"{ticker.lower()}_sample_input.csv",
+            mime="text/csv",
+        )
+
+        try:
+            feature_df = compute_model_features(edited_prices, feature_names, metadata)
+            payload = frame_to_payload(feature_df)
+            with st.expander("Computed model features sent to the API", expanded=False):
+                st.dataframe(feature_df.tail(8), use_container_width=True, hide_index=True)
+        except ValueError as exc:
+            st.error(str(exc))
+            feature_df = pd.DataFrame()
+
+    elif input_mode == "Upload CSV":
+        st.caption(
+            "Upload a CSV with the required recent price columns. "
+            "Use the sample CSV button from the table mode if you need a template."
+        )
+        uploaded_file = st.file_uploader("Upload recent price CSV", type=["csv"])
+
+        if uploaded_file is None:
+            st.info("Upload a CSV to enable prediction.")
+            feature_df = pd.DataFrame()
+        else:
+            uploaded_prices = pd.read_csv(uploaded_file)
+            st.caption("Uploaded rows")
+            st.dataframe(uploaded_prices.tail(8), use_container_width=True, hide_index=True)
+            if len(uploaded_prices) < seq_len:
+                st.error(f"The model needs at least {seq_len} rows. Uploaded rows: {len(uploaded_prices)}.")
+                feature_df = pd.DataFrame()
+            else:
+                try:
+                    recent_prices = uploaded_prices.tail(seq_len)
+                    feature_df = compute_model_features(recent_prices, feature_names, metadata)
+                    payload = frame_to_payload(feature_df)
+                    with st.expander("Computed model features sent to the API", expanded=False):
+                        st.dataframe(feature_df.tail(8), use_container_width=True, hide_index=True)
+                except ValueError as exc:
+                    st.error(str(exc))
+                    feature_df = pd.DataFrame()
+
+    else:
+        st.caption(
+            "Advanced mode sends the exact JSON body to FastAPI. "
+            "Use this mode for API documentation screenshots."
+        )
+        sample_payload = build_sample_payload(seq_len, feature_names, feature_count)
+        user_json = st.text_area(
+            "Model-ready JSON request",
+            value=json.dumps(sample_payload, indent=2),
+            height=260,
+        )
+
+        preview_payload = parse_payload(user_json)
+        if preview_payload:
+            payload = preview_payload
+            feature_df = features_to_frame(preview_payload, feature_names)
+            if not feature_df.empty:
+                st.caption("Model-ready input preview")
+                st.dataframe(feature_df.tail(8), use_container_width=True, hide_index=True)
+        else:
+            st.error("Invalid JSON request. It must include a `features` field.")
+            feature_df = pd.DataFrame()
+
+    if not feature_df.empty:
+        chart_cols = [col for col in ["Close", "Adjusted Close", "MA10", "MA20"] if col in feature_df.columns]
+        if chart_cols:
+            st.caption("Recent price and indicator trend")
+            st.line_chart(feature_df[chart_cols])
 
     if st.button("Predict Next-Day Price", type="primary"):
-        try:
-            payload = json.loads(user_json)
-        except json.JSONDecodeError as exc:
-            st.error("Invalid JSON input.")
-            st.code(str(exc))
+        if payload is None:
+            st.error("No valid input is available for prediction.")
             st.stop()
 
         response = post_api_json(endpoint, payload)
