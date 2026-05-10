@@ -1,0 +1,6 @@
+{
+  "artifact_name": "task4_vietnam_portfolio",
+  "task_type": "portfolio_construction",
+  "market": "Vietnam",
+  "description": "Portfolio output from Task 4. The GRU return model is treated as one part of a hybrid score with momentum, Sharpe ratio, liquidity, volatility, downside risk, and drawdown."
+}

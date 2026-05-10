@@ -1,0 +1,30 @@
+{
+  "artifact_name": "task2_vietnam_next_day",
+  "task_type": "price_forecasting",
+  "ticker": "VCB",
+  "market": "Vietnam",
+  "model_type": "gru",
+  "date_column": "Date",
+  "target_column": "Close",
+  "required_price_columns": [
+    "Open",
+    "High",
+    "Low",
+    "Close",
+    "Volume"
+  ],
+  "feature_columns": [
+    "Open",
+    "High",
+    "Low",
+    "Close",
+    "Volume",
+    "Log Return",
+    "MA10",
+    "MA20",
+    "Volatility10"
+  ],
+  "lookback_days": 30,
+  "forecast_horizon": 1,
+  "input_description": "Upload recent historical rows containing the required price columns. The API recomputes Log Return, MA10, MA20, and Volatility10 before prediction."
+}
