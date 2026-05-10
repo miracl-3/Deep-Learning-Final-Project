@@ -1,7 +1,7 @@
 {
   "artifact_name": "task1_nasdaq_next_day",
   "task_type": "price_forecasting",
-  "ticker": null,
+  "ticker": "GT",
   "market": "Nasdaq",
   "model_type": "gru",
   "date_column": "Date",
