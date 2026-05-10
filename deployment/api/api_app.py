@@ -1,179 +1,282 @@
+from __future__ import annotations
 
-from pathlib import Path
 import json
+import os
+from functools import lru_cache
+from pathlib import Path
+from typing import Any
 
 import joblib
 import numpy as np
 import pandas as pd
+import tensorflow as tf
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-from tensorflow import keras
 
 
-BASE_DIR = Path(__file__).resolve().parent
-ARTIFACT_DIR = BASE_DIR / "artifacts"
-
-app = FastAPI(
-    title="Stock Forecasting API",
-    description="Minimal API for Task 1/2 price forecasting and Task 4 portfolio output.",
-    version="1.0.0",
-)
+app = FastAPI(title="CS313 Stock Prediction API")
 
 
-class PredictionRequest(BaseModel):
-    artifact_name: str
-    records: list[dict]
+API_DIR = Path(__file__).resolve().parent
+DEPLOYMENT_DIR = API_DIR.parent
 
 
-def get_artifact_path(artifact_name: str) -> Path:
-    artifact_path = ARTIFACT_DIR / artifact_name
+def find_artifacts_dir() -> Path:
+    env_dir = os.environ.get("ARTIFACTS_DIR")
+    if env_dir:
+        return Path(env_dir)
 
-    if not artifact_path.exists():
-        available_artifacts = [
-            path.name for path in ARTIFACT_DIR.iterdir() if path.is_dir()
-        ] if ARTIFACT_DIR.exists() else []
+    candidates = [
+        DEPLOYMENT_DIR / "artifacts",
+        API_DIR / "artifacts",
+    ]
 
-        raise HTTPException(
-            status_code=404,
-            detail={
-                "message": f"Artifact not found: {artifact_name}",
-                "available_artifacts": available_artifacts,
-            },
-        )
+    for candidate in candidates:
+        if (candidate / "task1_nasdaq_next_day").exists():
+            return candidate
 
-    return artifact_path
+    return DEPLOYMENT_DIR / "artifacts"
 
 
-def load_metadata(artifact_path: Path) -> dict:
-    with open(artifact_path / "metadata.json", "r", encoding="utf-8") as file:
-        return json.load(file)
+ARTIFACTS_DIR = find_artifacts_dir()
+
+TASKS = {
+    "task1": {
+        "name": "Task 1.1 - Nasdaq next-day prediction",
+        "dir": ARTIFACTS_DIR / "task1_nasdaq_next_day",
+        "model": "model.keras",
+        "feature_scaler": "feature_scaler.pkl",
+        "target_scaler": "target_scaler.pkl",
+    },
+    "task2": {
+        "name": "Task 2.1 - Vietnam next-day prediction",
+        "dir": ARTIFACTS_DIR / "task2_vietnam_next_day",
+        "model": "model.keras",
+        "feature_scaler": "feature_scaler.pkl",
+        "target_scaler": "target_scaler.pkl",
+    },
+    "task4": {
+        "name": "Task 4 - Vietnam portfolio recommendation",
+        "dir": ARTIFACTS_DIR / "task4_vietnam_portfolio",
+        "model": "task4_return_model.keras",
+        "feature_scaler": "task4_feature_scaler.pkl",
+    },
+}
 
 
-def prepare_price_features_for_api(data: pd.DataFrame, metadata: dict) -> pd.DataFrame:
-    date_column = metadata["date_column"]
-    target_column = metadata["target_column"]
-    required_price_columns = metadata["required_price_columns"]
-    feature_columns = metadata["feature_columns"]
+class SequenceInput(BaseModel):
+    features: list[list[float]]
+    scaled: bool = False
 
-    required_columns = [date_column] + required_price_columns
-    missing_columns = [column for column in required_columns if column not in data.columns]
 
-    if missing_columns:
+class PortfolioInput(BaseModel):
+    features: list[list[float]] | None = None
+    scaled: bool = False
+
+
+def require_file(path: Path) -> Path:
+    if not path.exists():
+        raise HTTPException(status_code=500, detail=f"Missing artifact: {path}")
+    return path
+
+
+@lru_cache(maxsize=None)
+def load_model(task_key: str):
+    task = TASKS[task_key]
+    return tf.keras.models.load_model(require_file(task["dir"] / task["model"]), compile=False)
+
+
+@lru_cache(maxsize=None)
+def load_joblib(path_text: str):
+    return joblib.load(require_file(Path(path_text)))
+
+
+@lru_cache(maxsize=None)
+def load_metadata(task_key: str) -> dict[str, Any]:
+    path = TASKS[task_key]["dir"] / "metadata.json"
+    if not path.exists():
+        return {}
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def get_feature_names(metadata: dict[str, Any]) -> list[str]:
+    for key in ["features", "feature_columns", "model_features", "columns"]:
+        value = metadata.get(key)
+        if isinstance(value, list):
+            return value
+    return []
+
+
+def prepare_sequence_input(task_key: str, payload: SequenceInput) -> np.ndarray:
+    task = TASKS[task_key]
+    metadata = load_metadata(task_key)
+
+    raw = np.asarray(payload.features, dtype=float)
+
+    if raw.ndim != 2:
         raise HTTPException(
             status_code=400,
-            detail=f"Missing required columns: {missing_columns}",
+            detail="features must be a 2D list: rows of time steps by feature columns.",
         )
 
-    model_data = data.copy()
-    model_data[date_column] = pd.to_datetime(model_data[date_column], errors="coerce")
+    feature_names = get_feature_names(metadata)
+    if feature_names and raw.shape[1] != len(feature_names):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Expected {len(feature_names)} features per row, got {raw.shape[1]}. "
+                   f"Expected features: {feature_names}",
+        )
 
-    for column in required_price_columns:
-        model_data[column] = pd.to_numeric(model_data[column], errors="coerce")
+    seq_len = metadata.get("seq_len") or metadata.get("sequence_length")
+    if seq_len and raw.shape[0] != int(seq_len):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Expected {seq_len} rows/time steps, got {raw.shape[0]}.",
+        )
 
-    model_data = model_data.dropna(subset=required_columns)
-    model_data = model_data.sort_values(date_column).reset_index(drop=True)
+    if payload.scaled:
+        scaled = raw
+    else:
+        scaler = load_joblib(str(task["dir"] / task["feature_scaler"]))
+        scaled = scaler.transform(raw)
 
-    model_data["Log Return"] = np.log(
-        model_data[target_column] / model_data[target_column].shift(1)
-    )
-    model_data["MA10"] = model_data[target_column].rolling(window=10).mean()
-    model_data["MA20"] = model_data[target_column].rolling(window=20).mean()
-    model_data["Volatility10"] = model_data["Log Return"].rolling(window=10).std()
+    return np.expand_dims(scaled, axis=0)
 
-    model_data = model_data.replace([np.inf, -np.inf], np.nan)
-    model_data = model_data.dropna(subset=feature_columns).reset_index(drop=True)
 
-    return model_data
+def inverse_target(task_key: str, prediction_scaled: np.ndarray) -> np.ndarray:
+    task = TASKS[task_key]
+    target_scaler_path = task["dir"] / task["target_scaler"]
+
+    if not target_scaler_path.exists():
+        return prediction_scaled
+
+    target_scaler = load_joblib(str(target_scaler_path))
+    original_shape = prediction_scaled.shape
+
+    return target_scaler.inverse_transform(
+        prediction_scaled.reshape(-1, 1)
+    ).reshape(original_shape)
+
+
+def predict_next_day(task_key: str, payload: SequenceInput) -> dict[str, Any]:
+    model = load_model(task_key)
+    metadata = load_metadata(task_key)
+    x = prepare_sequence_input(task_key, payload)
+
+    prediction_scaled = model.predict(x, verbose=0)
+    prediction = inverse_target(task_key, prediction_scaled)
+
+    outputs = prediction.reshape(-1).astype(float).tolist()
+
+    return {
+        "task": TASKS[task_key]["name"],
+        "artifact_folder": TASKS[task_key]["dir"].name,
+        "ticker": metadata.get("ticker"),
+        "prediction_type": "next_day_prediction",
+        "predicted_next_day_value": outputs[0],
+        "all_model_outputs": outputs,
+        "note": "Only the first model output is used for the next-day task.",
+    }
+
+
+def read_csv_if_exists(path: Path, limit: int = 30) -> list[dict[str, Any]]:
+    if not path.exists():
+        return []
+
+    df = pd.read_csv(path).head(limit)
+    df = df.where(pd.notna(df), None)
+    return df.to_dict(orient="records")
+
+
+@app.get("/")
+def root():
+    return {
+        "message": "Stock Prediction API is running.",
+        "docs": "/docs",
+        "artifacts_dir": str(ARTIFACTS_DIR),
+    }
 
 
 @app.get("/health")
 def health():
-    return {"status": "ok"}
-
-
-@app.get("/models")
-def list_models():
-    if not ARTIFACT_DIR.exists():
-        return {"models": []}
-
-    models = []
-
-    for artifact_path in ARTIFACT_DIR.iterdir():
-        if artifact_path.is_dir() and (artifact_path / "metadata.json").exists():
-            models.append(load_metadata(artifact_path))
-
-    return {"models": models}
-
-
-@app.post("/predict-price")
-def predict_price(request: PredictionRequest):
-    artifact_path = get_artifact_path(request.artifact_name)
-    metadata = load_metadata(artifact_path)
-
-    if metadata["task_type"] != "price_forecasting":
-        raise HTTPException(
-            status_code=400,
-            detail="Selected artifact is not a price forecasting model.",
-        )
-
-    model = keras.models.load_model(artifact_path / "model.keras", compile=False)
-    feature_scaler = joblib.load(artifact_path / "feature_scaler.pkl")
-    target_scaler = joblib.load(artifact_path / "target_scaler.pkl")
-
-    input_data = pd.DataFrame(request.records)
-    model_data = prepare_price_features_for_api(input_data, metadata)
-
-    lookback_days = int(metadata["lookback_days"])
-    feature_columns = metadata["feature_columns"]
-
-    if len(model_data) < lookback_days:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Need at least {lookback_days} usable rows after feature engineering.",
-        )
-
-    latest_window = model_data.tail(lookback_days)
-    x_scaled = feature_scaler.transform(latest_window[feature_columns])
-    x_input = x_scaled.reshape(1, lookback_days, len(feature_columns))
-
-    prediction_scaled = model.predict(x_input, verbose=0).reshape(-1)
-    prediction = target_scaler.inverse_transform(
-        prediction_scaled.reshape(-1, 1)
-    ).reshape(-1)
-
     return {
-        "artifact_name": request.artifact_name,
-        "ticker": metadata["ticker"],
-        "market": metadata["market"],
-        "target_column": metadata["target_column"],
-        "forecast_horizon": metadata["forecast_horizon"],
-        "latest_input_date": str(latest_window[metadata["date_column"]].iloc[-1]),
-        "prediction": prediction.tolist(),
+        "status": "ok",
+        "artifacts_dir": str(ARTIFACTS_DIR),
+        "available_tasks": list(TASKS.keys()),
     }
 
 
-@app.get("/portfolio/{artifact_name}")
-def get_portfolio(artifact_name: str):
-    artifact_path = get_artifact_path(artifact_name)
-    metadata = load_metadata(artifact_path)
+@app.get("/models")
+def models():
+    result = {}
 
-    if metadata["task_type"] != "portfolio_construction":
-        raise HTTPException(
-            status_code=400,
-            detail="Selected artifact is not a portfolio artifact.",
-        )
-
-    result = {"metadata": metadata}
-
-    for file_name in [
-        "stock_scores.csv",
-        "risk_taking_portfolio.csv",
-        "prudent_portfolio.csv",
-        "portfolio_backtest_metrics.csv",
-    ]:
-        file_path = artifact_path / file_name
-
-        if file_path.exists():
-            result[file_name] = pd.read_csv(file_path).to_dict(orient="records")
+    for key, task in TASKS.items():
+        metadata = load_metadata(key)
+        result[key] = {
+            "name": task["name"],
+            "folder": str(task["dir"]),
+            "model_file": task["model"],
+            "metadata": metadata,
+        }
 
     return result
+
+
+@app.post("/predict/task1")
+@app.post("/predict/task1-nasdaq-next-day")
+def predict_task1(payload: SequenceInput):
+    return predict_next_day("task1", payload)
+
+
+@app.post("/predict/task2")
+@app.post("/predict/task2-vietnam-next-day")
+def predict_task2(payload: SequenceInput):
+    return predict_next_day("task2", payload)
+
+
+@app.get("/portfolio/task4")
+def get_task4_portfolios():
+    task_dir = TASKS["task4"]["dir"]
+
+    return {
+        "task": TASKS["task4"]["name"],
+        "prudent_portfolio": read_csv_if_exists(task_dir / "prudent_portfolio.csv"),
+        "risk_taking_portfolio": read_csv_if_exists(task_dir / "risk_taking_portfolio.csv"),
+        "stock_scores": read_csv_if_exists(task_dir / "stock_scores.csv"),
+    }
+
+
+@app.post("/predict/task4")
+@app.post("/predict/task4-vietnam-portfolio")
+def predict_task4(payload: PortfolioInput):
+    task = TASKS["task4"]
+    task_dir = task["dir"]
+
+    response = get_task4_portfolios()
+
+    if payload.features is None:
+        response["note"] = "No custom features provided. Returning saved Task 4 portfolio outputs."
+        return response
+
+    raw = np.asarray(payload.features, dtype=float)
+
+    if raw.ndim != 2:
+        raise HTTPException(
+            status_code=400,
+            detail="features must be a 2D list: rows by feature columns.",
+        )
+
+    if payload.scaled:
+        x = raw
+    else:
+        scaler = load_joblib(str(task_dir / task["feature_scaler"]))
+        x = scaler.transform(raw)
+
+    model = load_model("task4")
+    prediction = model.predict(x, verbose=0)
+
+    response["predicted_returns"] = prediction.reshape(-1).astype(float).tolist()
+    response["note"] = "Task 4 model prediction plus saved portfolio recommendation files."
+
+    return response
